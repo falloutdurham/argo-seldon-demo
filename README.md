@@ -58,9 +58,29 @@ Do a `docker images` and ensure that the image is in place.
 
 ## Setting up Argo & Seldon Core
 
+Before we can run our workflow and deploy our model, we need to install the Argo and Seldon Core operators in our k8s cluster. I'm assuming that you have Helm and Tiller running already. Create a new namespace for our models:
+
+    kubectl create namespace models
+
 ### Argo
 
+Firstly, install the `argo` CLI:
+
+    brew install argoproj/tap/argo
+
+Then install the operator and give permissions for the default admin role to create Argo workflows:
+
+    kubectl apply -n models -f https://raw.githubusercontent.com/argoproj/argo/stable/manifests/install.yaml
+    kubectl create rolebinding default-admin --clusterrole=admin --serviceaccount=default:default
+
 ### Seldon Core
+
+For Seldon Core, we need to install the operator and Ambassador, which we'll be using to serve the models (you can also use Istio):
+
+    helm install seldon-core-operator --name seldon-core --repo https://storage.googleapis.com/seldon-charts --set usageMetrics.enabled=true --namespace models
+
+    helm install stable/ambassador --name ambassador --set crds.keep=false
+
 
 ### PersistentVolumeClaim
 
@@ -80,9 +100,109 @@ Apply it with `kubectl apply -f pvc.yaml`.
 
 ## Workflows
 
+Argo is a workflow orchestrator/scheduler in a similar vein to other frameworks like Oozie or Airflow, but is Kubernetes-native. You can build up flows that are simply a series of sequential steps or move into a full-blown DAG job description. In this basic example, we'll be creating a simple two-step approach with the first step training the model and the second actually deploying it. 
+
+## Templates
+
+The core of Argo is the `template`. This describes either a container to run or a k8s resource to modify. Here's an example of the container-based template:
+
+    - name: training
+        inputs:
+            parameters:
+                - name: model-name
+        outputs:
+            parameters:
+                - name: model-location
+                valueFrom: 
+                    path: /tmp/model-location
+        container:
+            image: "{{inputs.parameters.model-name}}"
+            imagePullPolicy: IfNotPresent
+            command: [python]
+            args: ["train.py"]
+
+            volumeMounts:
+            - name: model-parameters
+                mountPath: /mnt/parameters    
+
+The `container` section is a standard container spec, so we can use all the standard keys there, in this case making sure we run `python train.py` to train the model and mounting our PVC to the required path. We can also pass in parameters and pass them downstream using Jinja2 templating (it feels a lot like using Ansible in practice!), and we can also specify output parameters too! Here, `train.py` will write the final destination of the model's trained parameters to `/tmp/model-location`, which will then be picked up by the next template so it knows where to look for the parameters file (or S3 bucket or wherever).
+
+We can also modify a k8s resource, which we do in the next template:
+
+      - name: deploying
+        inputs:
+          parameters:
+            - name: model-name
+            - name: model-location
+        resource:      
+          action: apply
+          successCondition: status.state == Available
+          failureCondition: status.failed > 3
+          manifest: |
+            apiVersion: machinelearning.seldon.io/v1alpha2
+            kind: SeldonDeployment
+            metadata:
+              name: "{{inputs.parameters.model-name}}"
+            spec:
+              name: "{{inputs.parameters.model-name}}"
+              predictors:
+              - componentSpecs:
+                - spec:
+                    volumes:
+                    - name: model-parameters
+                      persistentVolumeClaim:
+                          claimName: model-parameters-pvc
+                    containers:
+                    - image: "{{inputs.parameters.model-name}}"
+                      name: "{{inputs.parameters.model-name}}"
+                      env:
+                        - name: MODEL_LOCATION
+                          value: "{{inputs.parameters.model-location}}"
+                      volumeMounts:
+                        - mountPath: /mnt/parameters
+                          name: model-parameters
+                graph:
+                  endpoint:
+                    type: REST
+                  name: "{{inputs.parameters.model-name}}"
+                  type: MODEL
+                labels:
+                  version: v1
+                name: "{{inputs.parameters.model-name}}"
+                replicas: 1
+
+There's a lot going on here! Let's look at the Argo parts first and then delve into the actual SeldonDeployment resource we're creating. Our inputs are `model-name` and `model-location` (the latter of which will come from the previous template's output), and instead of supplying a `container`, we use a `resource`. We can use all the standard k8s verbs here providing we have permission, and we can also define what we term a successful deployment or a failed one using `successCondition` and `failureCondition`.
+
+Right, now we can look at the SeldonCore manifest! As it can describe a vast assortment of different model deployments (such as A/B testing, canary deployments, and construction of a full graph using different SeldonCore deployments), the `predictors` subsection has plenty of options which we won't need to delve into here (but go read the [docs](https://docs.seldon.io/projects/seldon-core)!). What we care about is just our little transformer model. We're injecting the `model-location` into the environment as `MODEL_LOCATION` so the model can locate the parameters during the initialization phase, and mounting the PVC so the container can get access to the shared storage space.
+
+## Steps
+
+With the templates defined, we can create our two-step workflow! We use `entrypoint` to tell Argo the first step to run, and then it will continue sequentially from there. You'll notice that each step is marked by `- -`; this tells Argo that the next step will not run until the previous has finished - otherwise it will launch them in parallel. Most of what we're doing here is just calling our defined templates and filling in the required parameters. Notice that we can access _global_ parameters with `workflow.parameters.*` and gain access to a step's parameters with something like `steps.step-name.outputs.parameters.parameter`.
+
+    entrypoint: train-deploy  
+    
+    - name: train-deploy
+      steps:
+    
+      - - name: train-model
+          template: training
+          arguments:
+            parameters:
+              - name: model-name
+                value: "{{workflow.parameters.model-name}}"
+      
+      - - name: deploy-model
+          template: deploying
+          arguments:
+            parameters:
+              - name: model-name
+                value: "{{workflow.parameters.model-name}}"
+              - name: model-location
+                value: "{{steps.train-model.outputs.parameters.model-location}}"
+
 ## Submitting Workflow to Argo
 
-Submitting the final workflow to Argo can either be done with `kubectl` or with `argo`:
+Submitting the final `train-deploy.yaml` workflow to Argo can either be done with `kubectl` or with `argo`:
 
     argo submit --watch train-deploy.yaml -p model-name="transformer"
 
@@ -112,4 +232,4 @@ And you'll get a response back that looks like this:
 
 ## Removing the deployed model
 
-You can get a list of deployed models with `kubectl get SeldonDeployment` and the Transformer model can be removed using `kubectl delete SeldonDeployment/transformer`. 
+You can get a list of deployed models with `kubectl get SeldonDeployment` and the Transformer model can be removed using `kubectl delete SeldonDeployment/transformer`. (don't just attempt to delete the `deployment` as SeldonCore will just bring it back ;P)
