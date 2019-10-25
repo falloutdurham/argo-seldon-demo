@@ -1,0 +1,99 @@
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: train-deploy-
+spec:
+  entrypoint: train-deploy
+  
+  volumes:
+  - name: model-parameters
+    persistentVolumeClaim:
+      claimName: model-parameters-pvc
+  
+  arguments:
+    parameters:
+    - name: model-name
+      value: default
+  
+  templates:
+  
+  - name: train-deploy
+    steps:
+  
+    - - name: train-model
+        template: training
+        arguments:
+          parameters:
+            - name: model-name
+              value: "{{workflow.parameters.model-name}}"
+    
+    - - name: deploy-model
+        template: deploying
+        arguments:
+          parameters:
+            - name: model-name
+              value: "{{workflow.parameters.model-name}}"
+            - name: model-location
+              value: "{{steps.train-model.outputs.parameters.model-location}}"
+    
+  - name: training
+    inputs:
+      parameters:
+        - name: model-name
+    outputs:
+      parameters:
+        - name: model-location
+          valueFrom: 
+            path: /tmp/model-location
+    container:
+      image: "{{inputs.parameters.model-name}}"
+      imagePullPolicy: IfNotPresent
+      command: [python]
+      args: ["train.py"]
+
+      volumeMounts:
+      - name: model-parameters
+        mountPath: /mnt/parameters
+
+  - name: deploying
+    inputs:
+      parameters:
+        - name: model-name
+        - name: model-location
+    resource:      
+      action: apply
+      successCondition: status.state == Available
+      failureCondition: status.failed > 3
+      manifest: |
+        apiVersion: machinelearning.seldon.io/v1alpha2
+        kind: SeldonDeployment
+        metadata:
+          name: "{{inputs.parameters.model-name}}"
+        spec:
+          name: "{{inputs.parameters.model-name}}"
+          predictors:
+          - componentSpecs:
+            - spec:
+                volumes:
+                - name: model-parameters
+                  persistentVolumeClaim:
+                      claimName: model-parameters-pvc
+                containers:
+                - image: "{{inputs.parameters.model-name}}"
+                  name: "{{inputs.parameters.model-name}}"
+                  env:
+                    - name: MODEL_LOCATION
+                      value: "{{inputs.parameters.model-location}}"
+                  volumeMounts:
+                    - mountPath: /mnt/parameters
+                      name: model-parameters
+            graph:
+              endpoint:
+                type: REST
+              name: "{{inputs.parameters.model-name}}"
+              type: MODEL
+            labels:
+              version: v1
+            name: "{{inputs.parameters.model-name}}"
+            replicas: 1

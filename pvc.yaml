@@ -1,0 +1,9 @@
+kind: PersistentVolumeClaim
+apiVersion: v1
+metadata:
+  name: model-parameters-pvc
+spec:
+  accessModes: [ "ReadWriteMany" ]
+  resources:
+    requests:
+      storage: 2Gi
